@@ -1,0 +1,83 @@
+#ifndef POSE_HPP
+#define POSE_HPP
+
+using namespace std;
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <openpose_ros_msgs/OpenPoseHumanList.h>
+#include <openpose_ros_msgs/PointWithProb.h>
+#include <openpose_ros_msgs/OpenPoseHuman.h>
+struct KeyPoint_prob
+{
+    float x;
+    float y;
+    float p;
+};
+
+struct KeyPoint_3d
+{
+    bool available;
+    float x;
+    float y;
+    float z;
+};
+
+class Pose
+{
+private:
+	int label;
+	int camera_index;
+    int _size;
+	vector<KeyPoint_prob> pose_joints;
+    vector<KeyPoint_3d> pose_joints_3d;
+
+public:
+
+    vector<KeyPoint_prob> pose_joints;
+    vector<KeyPoint_3d> pose_joints_3d;
+
+	Pose(){
+		pose_joints.resize(7);
+        vector<KeyPoint_3d> pose_joints_3d(7);
+        for(int i = 0; i < 7; ++i) {
+            pose_joints_3d.available = false;
+        }
+        _size = pose_joints.size();
+	}
+	~Pose(){}
+	void setPose(openpose_ros_msgs::OpenPoseHumanList& keypoints, int id);
+	void getPose(vector<KeyPoint_prob> &pose_joints);
+	void setCameraId(int camera_index){
+        camera_index = this->camera_index;
+    }
+	void setLabel(int label){
+        label = this->label;
+    };
+    int getLabel(){
+        return label;
+    }
+    void setLabel(int new_label){
+        label = new_label;
+    }
+    int getCameraId(){
+        return camera_index;
+    }
+    int getSize(){
+        return _size;
+    }
+};
+
+void Pose::setPose(openpose_ros_msgs::OpenPoseHumanList& keypoints, int id)
+{
+    for(int i = 0; i < 7; ++i) {
+        pose_joints[i].x = keypoints.human_list[id].body_key_points_with_prob[i].x;
+        pose_joints[i].y = keypoints.human_list[id].body_key_points_with_prob[i].y;
+        pose_joints[i].p = keypoints.human_list[id].body_key_points_with_prob[i].prob;
+    }
+	//cout << pose_joints.size() << endl;
+}
+
+
+
+#endif

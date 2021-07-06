@@ -1,0 +1,912 @@
+/*********************** opencv *************************/
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/opencv.hpp>
+/*********************** Marker *************************/
+#include <opencv2/aruco.hpp>
+#include <opencv2/aruco/dictionary.hpp>
+#include <vector>
+/*********************** ROS ****************************/
+#include <string>
+#include <ros/ros.h>
+#include <image_transport/image_transport.h>
+#include <tf/transform_broadcaster.h>
+#include <tf/transform_listener.h>
+#include <geometry_msgs/Twist.h>
+#include <geometry_msgs/PoseArray.h>
+#include <turtlesim/Spawn.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
+#include <tf_conversions/tf_eigen.h>
+#include <visualization_msgs/Marker.h>
+/*********************** LIBRARIES **********************/
+#include <eigen3/Eigen/Core>
+#include <eigen3/Eigen/Geometry>
+#include <cmath>
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
+/*********************** ROSBAG *************************/
+#include <openpose_ros_msgs/OpenPoseHumanList.h>
+#include <openpose_ros_msgs/PointWithProb.h>
+#include <openpose_ros_msgs/OpenPoseHuman.h>
+
+#include <iostream>
+#include <sstream>
+#include <fstream>
+#include <map>
+
+using namespace std;
+using namespace cv;
+using namespace ceres;
+
+struct KeyPoint_prob{
+	double x;
+	double y;
+	double p;
+};
+/*
+class smartPoint
+{
+private:
+	Pose *pose;
+public:
+//调用方法 smartPoint sp(new Pose(keypoints))
+	smartPoint(Pose *pose)
+	{
+		this->pose = pose;
+	}
+	//重载->
+	void *operator->()
+	{
+		return this->pose;
+	}
+	//重载*
+	Pose* operator*()
+	{
+		return *this->pose;
+	}
+	~smartPoint()
+	{
+		if(this->pose != NULL)
+		{
+			delete this->pose;
+			this->pose = NULL;
+		}
+	}
+};
+*/
+
+/************************非线性优化函数**********************************/
+struct CostFunction_cam {
+  	CostFunction_cam(Point3d _observe_point1, Point3d _observe_point2,
+	  				  Eigen::Matrix3d _camera_rot_1, Eigen::Matrix3d _camera_rot_2,
+					  Eigen::Matrix<double,3,1> _camera_trans_1,Eigen::Matrix<double,3,1> _camera_trans_2)
+	   :observe_point1(_observe_point1),observe_point2(_observe_point2),
+	  	camera_rot_1(_camera_rot_1), camera_rot_2(_camera_rot_2),
+	   	camera_trans_1(_camera_trans_1), camera_trans_2(_camera_trans_2){}
+
+// 残差的计算
+  	template <typename T>
+	  bool operator()(const T *const depths, T *residual) const {
+		const T cx = (T)(959.19/2), cy = (T)(578.16/2), fx = (T)(1061.45/2), fy = (T)(1056.70/2);
+		const T ccx = (T)(983.13/2), ccy = (T)(667.25/2), cfx = (T)(804.20/2), cfy = (T)(804.12/2);
+
+		Eigen::Matrix<T,3,1> Cam_point1;
+		Eigen::Matrix<T,3,1> Cam_point2;
+		Eigen::Matrix<T,3,1> World_point1;
+		Eigen::Matrix<T,3,1> World_point2;
+
+		Cam_point1(2,0) = depths[0];
+		Cam_point2(2,0) = depths[1];
+		Cam_point1(0,0) = (T(observe_point1.x) - cx) * Cam_point1(2,0) / fx;
+		Cam_point1(1,0) = (T(observe_point1.y) - cy) * Cam_point1(2,0) / fy;
+		Cam_point2(0,0) = (T(observe_point2.x) - cx) * Cam_point2(2,0) / fx;
+		Cam_point2(1,0) = (T(observe_point2.y) - cy) * Cam_point2(2,0) / fy;
+		World_point1 = camera_rot_1.cast<T>() * Cam_point1 + camera_trans_1.cast<T>();
+		World_point2 = camera_rot_2.cast<T>() * Cam_point2 + camera_trans_2.cast<T>();
+
+    	residual[0] = ((World_point1(0,0) - World_point2(0,0)) * (World_point1(0,0) - World_point2(0,0))
+					+(World_point1(1,0) - World_point2(1,0)) * (World_point1(1,0) - World_point2(1,0))
+					+(World_point1(2,0) - World_point2(2,0)) * (World_point1(2,0) - World_point2(2,0)));
+
+    	return true;
+
+  	}
+
+	Point3d observe_point1;
+	Point3d observe_point2;
+	Eigen::Matrix3d camera_rot_1;
+	Eigen::Matrix3d camera_rot_2;
+	Eigen::Matrix<double,3,1> camera_trans_1;
+	Eigen::Matrix<double,3,1> camera_trans_2;
+};
+
+double min(double a, double b)
+{
+	return ((a < b)? a:b);
+}
+
+class Pose
+{
+private:
+	int label;
+	int camera_index;
+	vector<KeyPoint_prob> pose_joints;
+	vector<vector<KeyPoint_prob>> pose_index;
+public:
+	Pose(){
+		pose_joints.resize(7);
+	}
+	~Pose(){}
+	void setPose(openpose_ros_msgs::OpenPoseHumanList& keypoints, int id);
+	void setCameraId(int id){
+        camera_index = id;
+    }
+	void setLabel(int label){
+        label = label;
+    };
+};
+
+void Pose::setPose(openpose_ros_msgs::OpenPoseHumanList& keypoints, int id)
+{
+    for(int i = 0; i < 7; ++i) {
+         pose_joints[i].x = keypoints.human_list[id].body_key_points_with_prob[i].x;
+         pose_joints[i].y = keypoints.human_list[id].body_key_points_with_prob[i].y;
+         pose_joints[i].p = keypoints.human_list[id].body_key_points_with_prob[i].prob;
+    }
+
+}
+/*
+    时间：2019年12月1日
+    检测marker姿态并且作为世界坐标系的原点，然后计算得出相机在世界坐标系下的姿态;
+    将在openpose下的2D姿态记录下来;
+*/
+class ImageProcessor
+{
+public:
+	ImageProcessor(int camera_index, string camera_type):it(nh)
+	{
+		cout << "回调函数开始" << endl;
+		camera_index_ = camera_index;
+
+		char color_topic[50];
+		string image_topic = "/qhd/image_color_rect";
+		camera_type += image_topic;
+		//sprintf(color_topic,"%s%s",camera_topic,image_topic);
+		image_sub =it.subscribe(camera_type,1,&ImageProcessor::imageCallback,this);
+
+		char key_points_topic[50];
+		sprintf(key_points_topic,"openpose_ros/human_list_%d",camera_index);
+		human_keypoints_sub = nh.subscribe(key_points_topic,1,&ImageProcessor::human_keypoints_callback,this);
+
+		initCalibration(0.333,camera_index_);
+		//image = Mat(size_color,CV_8UC3);
+
+		cout << "回调函数结束" << endl;
+	}
+	int getPersonNum()
+	{
+		return person_num;
+	}
+
+	void getMarkerCenter(vector<Point2f>& marker_center)
+	{
+		marker_center = this->marker_center;
+	}
+
+	void getCameraPose(Eigen::Matrix3d & camera_rot,Eigen::Matrix<double,3,1>& camera_trans)
+	{
+		camera_rot = this->camera_rot;
+		camera_trans = this->camera_trans;
+	}
+
+	void getKinectPose(Eigen::Matrix3d &kinect_rot, Eigen::Matrix<double,3,1> &kinect_trans)
+	{
+		kinect_rot = this->kinect_rot;
+		kinect_trans = this->kinect_trans;
+	}
+
+	void getHumanJoint(vector<KeyPoint_prob>& key_points_basic)
+	{
+		key_points_basic = this->key_points_basic;
+	}
+/*
+	void getHumanPose(vector<vector<KeyPoint_prob>>& pose_index)
+	{
+		pose_index = pose
+	}
+*/
+	void sendMarkerTf(vector<Vec3d>& marker_trans,vector<Vec3d>& marker_rot,vector<int>& ids,string camera_id,Eigen::Matrix3d& temp_rot,Eigen::Matrix<double,3,1>& trans);
+	//void sendWorldTf(const Eigen::Matrix<double, 3, 1>& point,const int camera_id, const string& camera_name);
+	void sendWorldTf(const Point3d& point,const int axes_id, const string& camera_name);
+
+/************************************* Camera **********************************************/
+
+	void imageCallback(const sensor_msgs::ImageConstPtr& msg);
+	void loadCalibrationFiles(std::string& calib_path, cv::Mat& cameraMatrix, cv::Mat& distCoeffs, double scale);
+	void initCalibration(double scale,int camera_index);
+	void ComputeKinectPose(Eigen::Matrix3d &Cam_rot, Eigen::Matrix<double,3,1> &Cam_trans);
+
+/************************************* Marker function *************************************/
+
+	void getMarker(cv::Mat &marker_image,vector<Point2f>& marker_center, bool Key);
+	void getMarkerCoordinate(vector<vector<Point2f>>& corners,vector<int>& ids,vector<Point2f>& marker_center_);
+
+/************************************* human_track *****************************************/
+
+	void human_keypoints_callback(openpose_ros_msgs::OpenPoseHumanList keypoints);
+	void draw_human_pose(Mat& image,const vector<KeyPoint_prob>& human_joints, Scalar color);
+	void savePose(vector<KeyPoint_prob>& unsort_keypoints);
+
+private:
+	int camera_index_;
+
+	ros::NodeHandle nh;
+	image_transport::ImageTransport it;
+    image_transport::Subscriber image_sub;
+	ros::Subscriber human_keypoints_sub;
+	tf::TransformListener listener;
+
+	string camera_type;
+	cv::Mat distCoeffs;
+	cv::Mat cameraMatrix;
+
+	cv::Mat image;
+	cv::Mat image_origin;
+	//cv::Size size_color = Size(640, 640 / 1920 * 1080);
+
+	cv::Ptr<aruco::Dictionary> dictionary;
+
+	Eigen::Matrix3d camera_rot;
+	Eigen::Matrix<double,3,1> camera_trans;
+	Eigen::Matrix3d kinect_rot;
+	Eigen::Matrix<double,3,1> kinect_trans;
+
+	vector<Point2f> marker_center;
+	Eigen::Matrix<double,3,1> worldPoint;
+
+	vector<KeyPoint_prob> key_points_basic;
+	vector<int> camera_pose;
+
+	int person_num;
+	vector<Pose> pose;
+};
+
+
+void ImageProcessor::imageCallback(const sensor_msgs::ImageConstPtr& msg)
+{
+	try
+	{
+		cv::Mat color_mat = cv_bridge::toCvShare(msg,"bgr8")->image;
+		image = color_mat.clone();
+		//cv::resize(image, image, Size(640, 360));
+		ComputeKinectPose(kinect_rot,kinect_trans);
+		if(!key_points_basic.empty()){
+			draw_human_pose(image,key_points_basic,cv::Scalar(255,0,0));
+		}
+		getMarker(image,marker_center,0);
+		//cout << "marker_center:" << marker_center << endl;
+		char camera_ID[20];
+		sprintf(camera_ID,"camera_%d",camera_index_);
+		cv::imshow(camera_ID,image);
+		cv::waitKey(3);
+
+	}
+	catch(cv_bridge::Exception& e)
+	{
+		ROS_ERROR("Could not convert from '%s' to 'bgr8'.",msg->encoding.c_str());
+		return;
+	}
+}
+
+void ImageProcessor::loadCalibrationFiles(std::string& calib_path, cv::Mat& cameraMatrix, cv::Mat& distCoeffs, double scale)
+{
+	cv::FileStorage fs;
+
+	cv::Mat cameraMatrix_origin;
+
+	calib_path = calib_path + "/calib_color.yaml";
+	std::cout << calib_path << std::endl;
+	if(fs.open(calib_path, cv::FileStorage::READ))
+	{
+	std::cout << "open!" << std::endl;
+	fs["cameraMatrix"] >> cameraMatrix_origin;
+	std::cout << "matrix load success" << std::endl;
+	cameraMatrix = cameraMatrix_origin.clone();
+	cameraMatrix.at<double>(0,0) *=scale;
+	cameraMatrix.at<double>(1,1) *=scale;
+	cameraMatrix.at<double>(0,2) *=scale;
+	cameraMatrix.at<double>(1,2) *=scale;
+
+	distCoeffs = cv::Mat::zeros(1,5,CV_64F);
+
+	//fs["distortionCoefficients"] >> distCoeffs;
+	//std::cout << "matrix load success" << std::endl;
+	fs.release();
+	}
+}
+
+void ImageProcessor::initCalibration(double scale,int camera_index)
+{
+	string calib_path = "/home/xuchengjun/catkin_ws/src/cv_camera/kinect_calibration_data";
+	loadCalibrationFiles(calib_path,cameraMatrix,distCoeffs,scale);
+}
+
+/***************************功能：读取marker中心点的坐标，主要是在早期验证相机位姿和TF发布坐标的准确性***********************/
+void ImageProcessor::getMarkerCoordinate(vector<vector<Point2f>>& corners,vector<int>& ids,vector<Point2f>& marker_center_)
+{
+	for(int i=0;i<ids.size();i++)
+	{
+		Point2f center(0.f,0.f);
+		for(int j=0;j<corners[i].size();j++)
+		{
+			if(ids[i] == 0)
+			{
+				center += corners[i][j];
+			}
+		}
+		center /= 4.0;
+		marker_center_.push_back(center);
+	}
+}
+
+/**********************功能：读取marker_0的姿态，并返回相对于marker的相机的旋转和平移矩阵**********************************/
+void ImageProcessor::getMarker(cv::Mat &marker_image,vector<Point2f>& marker_center, bool Key)
+{
+	dictionary = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+	std::vector<int> ids;
+	std::vector<std::vector<cv::Point2f> > corners;
+	std::vector<cv::Vec3d> rvecs,tvecs;
+
+	if(!marker_image.empty())
+	{
+		cv::aruco::detectMarkers(marker_image,dictionary,corners,ids);
+		if(ids.size() > 0)
+		{
+			cv::aruco::drawDetectedMarkers(marker_image,corners,ids);
+			for(int i=0;i<ids.size();i++)
+			{
+				cv::aruco::estimatePoseSingleMarkers(corners,0.155,cameraMatrix,distCoeffs,rvecs,tvecs);
+				if(!rvecs.empty() && !tvecs.empty() && ids[i] == 0)
+				{
+					cv::aruco::drawAxis(marker_image,cameraMatrix,distCoeffs,rvecs[i],tvecs[i],0.1);
+					getMarkerCoordinate(corners,ids,marker_center);
+
+				}
+				char num[10];
+				sprintf(num,"camera_%d",camera_index_);
+				if(Key == 1)
+				{
+					sendMarkerTf(tvecs,rvecs,ids,num,camera_rot,camera_trans);
+				}
+			}
+		}
+	}
+
+}
+
+/*************************功能：将相机的位姿通过tf发送到rviz中**********************************/
+void ImageProcessor::sendMarkerTf(vector<Vec3d>& marker_trans,vector<Vec3d>& marker_rot,vector<int>& ids,string camera_id,Eigen::Matrix3d& temp_rot,Eigen::Matrix<double,3,1>& trans)
+{
+	Mat rot(3, 3, CV_64FC1);
+	Mat rot_to_ros(3, 3, CV_64FC1);
+	rot_to_ros.at<double>(0,0) = -1.0;
+	rot_to_ros.at<double>(0,1) = 0.0;
+	rot_to_ros.at<double>(0,2) = 0.0;
+	rot_to_ros.at<double>(1,0) = 0.0;
+	rot_to_ros.at<double>(1,1) = 0.0;
+	rot_to_ros.at<double>(1,2) = 1.0;
+	rot_to_ros.at<double>(2,0) = 0.0;
+	rot_to_ros.at<double>(2,1) = 1.0;
+	rot_to_ros.at<double>(2,2) = 0.0;
+
+	static tf::TransformBroadcaster marker_position_broadcaster;
+    for(int i = 0; i < ids.size(); i++)
+    {
+
+		if(ids[i] == 0)
+		{
+			cv::Rodrigues(marker_rot[i], rot);
+        	rot.convertTo(rot, CV_64FC1);
+
+
+        	tf::Matrix3x3 tf_rot(rot.at<double>(0,0), rot.at<double>(0,1), rot.at<double>(0,2),
+                             rot.at<double>(1,0), rot.at<double>(1,1), rot.at<double>(1,2),
+                             rot.at<double>(2,0), rot.at<double>(2,1), rot.at<double>(2,2));
+
+
+        	tf::Vector3 tf_trans(marker_trans[i][0], marker_trans[i][1], marker_trans[i][2]);
+        	tf::Transform transform(tf_rot, tf_trans);
+			transform = transform.inverse();
+			Eigen::Quaterniond q_eigen;
+			tf::quaternionTFToEigen(transform.getRotation(), q_eigen);
+			temp_rot = q_eigen;
+			tf::vectorTFToEigen(transform.getOrigin(), trans);
+        	ostringstream oss;
+        	oss << "marker_" << ids[i];
+        	marker_position_broadcaster.sendTransform(tf::StampedTransform(transform, ros::Time::now(), oss.str(), camera_id.c_str()));
+		}
+
+    }
+}
+
+/********************************功能：将计算后的3D点通过tf发出，验证计算的准确性******************************/
+void ImageProcessor::sendWorldTf(const Point3d& point,const int axes_id, const string& camera_name)
+{
+    static tf::TransformBroadcaster world_position;
+
+    tf::Vector3 tf_trans(point.x, point.y, point.z);
+	tf::Quaternion q(0,0,0,1);
+    tf::Transform transform(q, tf_trans);
+    char marker_name[20];
+	sprintf(marker_name, "%d", axes_id);
+    world_position.sendTransform(tf::StampedTransform(transform, ros::Time::now(),camera_name.c_str(), marker_name));
+}
+
+/*******************************功能：通过tf监听得到kinect相机的位姿，用于在录制的视频播放;
+ *                              在实际中我们会通过marker得到相机的位姿，这段程序将不被使用******************************/
+void ImageProcessor::ComputeKinectPose(Eigen::Matrix3d &Cam_rot, Eigen::Matrix<double,3,1> &Cam_trans)
+{
+	tf::StampedTransform transform;
+	char kinect_id[10];
+	sprintf(kinect_id,"camera_base_%d",camera_index_);
+ 	try
+    {
+        listener.waitForTransform("/marker_0",kinect_id,ros::Time(0),ros::Duration(3.0));
+        listener.lookupTransform("/marker_0",kinect_id,ros::Time(0),transform);
+    }
+    catch (tf::TransformException &ex)
+    {
+        ROS_ERROR("%s",ex.what());
+        ros::Duration(1.0).sleep();
+    }
+	Eigen::Quaterniond q(transform.getRotation().getW(),transform.getRotation().getX(),transform.getRotation().getY(),transform.getRotation().getZ());
+    Eigen::Vector3d trans(transform.getOrigin().getX(),transform.getOrigin().getY(),transform.getOrigin().getZ());
+	Cam_rot=q.toRotationMatrix();
+	Cam_trans = trans;
+}
+
+/******************************功能：读取openpose下的2d关节信息************************************/
+void ImageProcessor::human_keypoints_callback(openpose_ros_msgs::OpenPoseHumanList keypoints)
+{
+	key_points_basic.clear();
+	person_num = keypoints.num_humans;
+	pose.resize(person_num);
+	vector<vector<double> > distance_pool;
+	distance_pool.resize(person_num);
+	if(person_num > 0)
+	{
+		int person_index = 0;
+		for(int person=0;person < person_num;++person)
+		{
+			auto body_keypoints = keypoints.human_list[person].body_key_points_with_prob;
+
+			int count = 0;
+			double prob_sum = 0.0;
+			for(int i=0;i < body_keypoints.size();i++)
+			{
+				if(body_keypoints[i].prob > 0.0)
+				{
+					prob_sum += body_keypoints[i].prob;
+					count++;
+				}
+			}
+			double prob_eval = prob_sum/count;
+			if(prob_eval < 0.4)
+			{
+				continue;
+			}
+            pose[person_index].setLabel(-1);
+            pose[person_index].setCameraId(camera_index_);
+            pose[person_index].setPose(keypoints, person_index);
+		}
+	}
+}
+
+/************************************在图像中画出人体骨骼框架**********************************/
+void ImageProcessor::draw_human_pose(Mat& image,const vector<KeyPoint_prob>& human_joints, Scalar color)
+{
+	if(human_joints.empty())
+	{
+		ROS_INFO("No joints!");
+	}
+	if(image.empty())
+	{
+		ROS_INFO("No Image!");
+	}
+
+	if(human_joints[0].p < 0.01)
+	{
+		cout << "the correspondence is too low!" << endl;
+	}
+	else{
+		circle(image, cv::Point(human_joints[0].x, human_joints[0].y), 3, color, -1, 8);
+		for(int i=1; i < human_joints.size(); i++)
+		{
+			if(human_joints[i].p < 0.01)
+				continue;
+			circle(image, cv::Point(human_joints[i].x, human_joints[i].y), 3, color, -1, 8);
+			if(i != 7 && i != 0)
+				line(image, cv::Point(human_joints[i-1].x, human_joints[i-1].y), cv::Point(human_joints[i].x, human_joints[i].y), color, 2);
+		}
+	}
+
+	//ROS_INFO("Human pose drawed.");
+}
+
+void ImageProcessor::savePose(vector<KeyPoint_prob>& unsort_keypoints)
+{
+	if(!unsort_keypoints.empty())
+	{
+		//pose.setPose(unsort_keypoints);
+		//pose->setPose(unsort_keypoints);
+	}
+}
+
+/*
+	以下为每一帧的姿态融合算法
+*/
+/*
+	一台相机能够捕获一个人的一个2D姿态（pose）
+	在pose类中，需要保存人姿态以及label
+	input：person_num
+	output:the pose and label of every person
+*/
+
+
+
+/*
+class PreframeAssociation
+{
+private:
+	vector<KeyPoint_prob> keypoints;
+
+
+	double cx = 959.19/2;
+	double cy = 578.16/2;
+	double fx = 1061.45/2;
+	double fy = 1056.70/2;
+
+	double depths[7][2] = {};
+
+
+public:
+	PreframeAssociation();
+	~PreframeAssociation();
+
+	double getPoseSimilarity();
+	void getAvailablePose();
+	void optimizeWithCeres();
+	double distance();
+	double getE_2dDistance();
+	void min_value(const vector<vector<double>>& similarity_socre, int a[]);
+	double getFullCorrespondence();
+
+
+	ceres::Problem problem;
+	//solver
+	ceres::Solver::Options options;
+	options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+	options.minimizer_progress_to_stdout = true;
+	ceres::Solver::Summary summary;
+};
+
+void PreframeAssociation::getAvailablePose(const vector<KeyPoint_prob>& keypoints, vector<int>& pose)
+{
+
+}
+
+double PreframeAssociation::getPoseSimilarity(const vector<Pose>& pose_1, const vector<Pose>& pose_2)
+{
+	int index[2];
+	vector<vector<double>> deta;   //vector<double> correspondence
+	vector<double> tmp;
+	int dimension_1 = pose_1.size();
+	int dimension_2 = pose_2.size();
+	int sharedJoints = 14;
+	int cam_a_associated_pose = 1;
+	int cam_b_associated_pose = 1;
+	if(dimension_1 != dimension_2)
+	{
+		return 0;
+	}
+	double similarity = 0.0;    //deta
+	int count = 0;
+
+	for(int i=0; i<dimension_1; ++i)
+	{
+		tmp.clear();
+		for(int j=0; j<dimension_2; ++j)
+		{
+			similarity = getFullCorrespondence(pose_1[i], pose_2[j]) / (sharedJoints * cam_a_associated_pose * cam_b_associated_pose);// get complete correspondence score between the two full pose.
+			tmp.push_back(similarity);
+		}
+		deta.push_back(tmp);
+	}
+
+	//then we should compute the value of r. if i get the mindeta, i should return the min value index.
+	if(!deta.empty())
+	{
+		int detaindex[2];
+		min_value(deta, detaindex);
+		cout << detaindex[0] << "  " << detaindex[1] << endl;
+	}
+	//ceres optimizer
+
+
+}
+
+void PreframeAssociation::min_value(const vector<vector<double>>& similarity_score, int a[])
+{
+	double min_value = similarity_score[0][0];
+	for(int i=0; i<similarity_score.size(); i++)
+	{
+		for(int j=0; j<similarity_score[i].size(); j++)
+		{
+			if(min_value > similarity_score[i][j])
+			{
+				min_value = similarity_score[i][j];
+				a[0] = i;
+				a[1] = j;
+			}
+		}
+	}
+}
+// pre-pose association
+double PreframeAssociation::getFullCorrespondence(Pose& pose_1, Pose& pose_2)
+{
+	int count = 0;
+	double sum_E_2d;
+	if(!pose_1)    //check pose is not empty
+	{
+		for(int i=0; i<pose_1.size(); i++)
+		{
+			sum_E_2d = getE_2dDistance(pose_1[i], pose_2[i]);
+			count++;
+		}
+		if(sum_E_2d / count < 0.4)
+		{
+			return sum_E_2d / count;
+		}
+	}
+}
+
+//E2d
+double PreframeAssociation::getE_2dDistance(KeyPoint_prob& pose_1_keypoint, KeyPoint_prob& pose_2_keypoint)
+{
+	double openpose_correspondence =0.0;
+	double E_2d;
+	openpose_correspondence = 1.0 / std::sqrt(pose_1_keypoint.p * pose_2_keypoint.p);
+	E_2d = openpose_correspondence * getOujidistance(pose_1_keypoint, pose_2_keypoint);
+	return E_2d;
+}
+
+double PreframeAssociation::getSpacedistance(vector<KeyPoint_prob>& pose_1_keypoint, vector<KeyPoint_prob>& pose_2_keypoint)
+{*/
+	//ceres-solver
+
+
+	/******there is a error:sqrt(double)is ambiguity,if there is no std**********/
+/*	return std::sqrt((cam_a_points.x - cam_b_points.x) * (cam_a_points.x - cam_b_points.x) +
+					 (cam_a_points.y - cam_b_points.y) * (cam_a_points.y - cam_b_points.y) +
+					 (cam_a_points.z - cam_b_points.z) * (cam_a_points.z - cam_b_points.z));
+}
+
+void PreframeAssociation::optimizeWithCeres(vector<KeyPoint_prob>& pose_1_keypoint, vector<KeyPoint_prob>& pose_2_keypoint, vector<Eigen::Matrix3d>& camera_rot, vector<Eigen::Matrix<double, 3 ,1>>& camera_trans)
+{
+	if(pose_1_keypoint.size() != pose_2_keypoint.size())
+	{
+		ROS_INFO("The number of joints are not same!");
+	}
+
+	if(!pose_1_keypoint.empty() && !pose_2_keypoint.empty())
+	{
+		for(int i=0; i<pose_1_keypoint.size(); i++)
+		{
+			problem.AddResidualBlock(
+				new ceres::AutoDiffCostFunction<CostFunction_cam, 1, 2>(
+					new CostFunction_cam(pose_1_keypoint[i], pose_2_keypoint[i], camera_rot, camera_trans)
+				),
+				nullptr,
+				depths[i]
+			);
+		}
+		ceres::Solve(options, &problem, &summary);
+		cout << summary.BriefReport() <<endl;
+	}
+}
+*/
+Point3d solve_point_av(Point3d& point_1, Point3d& point_2)
+{
+	Point3d point_av;
+	point_av.x = (point_1.x + point_2.x) / 2;
+	point_av.y = (point_1.y + point_2.y) / 2;
+	point_av.z = (point_1.z + point_2.z) / 2;
+
+	return point_av;
+
+}
+
+
+void point3d_To_matrix(Point3d& point, Eigen::Matrix<double,3,1>& matrix)
+{
+	matrix(0,0) = point.x;
+	matrix(1,0) = point.y;
+	matrix(2,0) = point.z;
+}
+
+void matrix_to_point3d(Eigen::Matrix<double,3,1>& matrix, Point3d& point)
+{
+	point.x = matrix(0,0);
+	point.y = matrix(1,0);
+	point.z = matrix(2,0);
+}
+
+
+int main(int argc,char **argv)
+{
+	ros::init(argc,argv,"marker_node");
+	ros::NodeHandle n;
+	tf::TransformListener listener;
+	ros::Publisher pose_pub = n.advertise<visualization_msgs::Marker>("visualization_marker",1);
+	ros::Rate loop_rate(30);
+
+	ImageProcessor cam_a(1,"kinect2_1");
+	ImageProcessor cam_b(2,"kinect2_2");
+
+	int N = 7*2;
+	vector<KeyPoint_prob> key_point1, key_point2;
+	vector<int> _camera_pose;
+	Eigen::Matrix3d cam_rot_1, cam_rot_2;
+	Eigen::Matrix<double,3,1> cam_trans_1, cam_trans_2;
+	vector<Eigen::Matrix3d> camera_rot;
+	vector<Eigen::Matrix<double,3,1>> camera_trans;
+	vector<Point3d> p1_data(N), p2_data(N);
+	double valid_score = 0.0, valid_score_last = 0.0;
+	double joints_score, distance_2d;
+	vector<double> jointpoints;
+
+	//配置求解器
+	//ceres::Solver::Options options;
+	//options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+	//options.minimizer_progress_to_stdout = true;
+
+  	double depths[N][2] = {}; //待优化值
+	double cx = 959.19/2, cy = 578.16/2, fx = 1061.45/2, fy = 1056.70/2;
+	double ccx = 983.13/2, ccy = 667.25/2, cfx = 804.20/2, cfy = 804.12/2;
+
+	while(ros::ok()){
+		cam_a.getKinectPose(cam_rot_1,cam_trans_1);
+		//cam_b.getKinectPose(cam_rot_2,cam_trans_2);
+		cam_a.getHumanJoint(key_point1);
+		//cam_b.getHumanJoint(key_point2);
+		//在这，我们得到了相机的旋转和平移和没有分类的多人人体关节点，但是相机的外参没有必要实时获取，可以考虑获取一次并保存。
+
+		if(!key_point1.empty()){
+			//for(vector<KeyPoint_prob>::iterator it = key_point1.begin(); it != key_point1.end(); it++)
+			//{
+			//	cout << "x is:" << it->x <<" " << "y is:" << it->y << " " << "P is:" << it->p << endl;
+			//}
+
+			/*
+			for(int i=0;i<N;i++)
+			{
+				p1_data[i].x = key_point1[i].x;
+				p1_data[i].y = key_point1[i].y;
+				p1_data[i].z = key_point1[i].p;
+				p2_data[i].x = key_point2[i].x;
+				p2_data[i].y = key_point2[i].y;
+				p2_data[i].z = key_point2[i].p;
+			}
+			//for(vector<Point3d>::iterator it = p1_data.begin(); it != p1_data.end(); it++){
+			//	cout << *it << endl;
+			//}
+
+
+			ceres::Problem problem;
+			for(int i=0;i < key_point2.size();i++)
+			{
+    			problem.AddResidualBlock(     // 向问题中添加误差项
+    	  		// 使用自动求导，模板参数：误差类型，输出维度，输入维度，维数要与前面struct中一致
+      			new ceres::AutoDiffCostFunction<CostFunction_cam, 1, 2>(
+        			new CostFunction_cam(p1_data[0], p2_data[i],cam_rot_1,cam_rot_2,cam_trans_1,cam_trans_2)
+      			),
+      			nullptr,            // 核函数，这里不使用，为空
+      			depths[i]                // 待估计参数
+    			);
+			}
+			ceres::Solver::Summary summary;
+			ceres::Solve(options, &problem, &summary);
+			cout << summary.BriefReport() << endl;
+		//	for(int i=0;i<N;i++)
+		//		cout << depths[i][0] << "  " << depths[i][1] << endl;
+
+			visualization_msgs::Marker points,line_strip;
+			points.header.frame_id = line_strip.header.frame_id = "marker_0";
+			points.header.stamp = line_strip.header.stamp = ros::Time::now();
+			points.ns = line_strip.ns = "marker_node";
+			points.action = line_strip.action = visualization_msgs::Marker::ADD;
+			points.pose.orientation.w = line_strip.pose.orientation.w = 1.0;
+			points.pose.orientation.x = line_strip.pose.orientation.x = 0.0;
+			points.pose.orientation.y = line_strip.pose.orientation.y = 0.0;
+			points.pose.orientation.z = line_strip.pose.orientation.z = 0.0;
+			points.id = 0;
+			line_strip.id = 1;
+
+			points.type = visualization_msgs::Marker::POINTS;
+			line_strip.type = visualization_msgs::Marker::LINE_STRIP;
+
+			points.scale.x = 0.03;
+			points.scale.y = 0.03;
+			points.scale.z = 0.03;
+			line_strip.scale.x = 0.02;
+
+			points.color.r = 1.0;
+			points.color.a = 1.0;
+			line_strip.color.g = 1.0;
+			line_strip.color.a = 1.0;
+
+			points.lifetime = line_strip.lifetime = ros::Duration(1);
+
+			vector<Point3d> Cam_Point1(N), Cam_Point2(N);
+			vector<Eigen::Matrix<double,3,1>> Wor_Point1(N),Wor_Point2(N);
+
+			for(int i=0;i<key_point2.size();i++)
+			{
+				Cam_Point1[i].z = depths[i][0];
+				Cam_Point2[i].z = depths[i][1];
+				Cam_Point1[i].x = (p1_data[i].x - cx) * Cam_Point1[i].z / fx;
+				Cam_Point1[i].y = (p1_data[i].y - cy) * Cam_Point1[i].z / fy;
+				Cam_Point2[i].x = (p2_data[i].x - cx) * Cam_Point2[i].z / fx;
+				Cam_Point2[i].y = (p2_data[i].y - cy) * Cam_Point2[i].z / fy;
+			}
+
+			distance_2d = get2D_correspondence(key_point1,key_point2, Cam_Point1, Cam_Point2);
+			valid_score = getValidCorrespondence(Cam_Point1, Cam_Point2, distance_2d);
+
+			jointpoints.push_back(valid_score);
+					for(vector<double>::iterator it=jointpoints.begin(); it != jointpoints.end(); it++)
+				cout << *it << endl;
+
+
+			if(valid_score < 0.4)
+			{
+				vector<vector<Point3d>> label;
+				valid_score_last = valid_score;
+				cout << "The valid score is: " << valid_score << endl;
+				for(int i=0; i < N;i++){
+					point3d_To_matrix(Cam_Point1[i],Wor_Point1[i]);
+					point3d_To_matrix(Cam_Point2[i],Wor_Point2[i]);
+					Wor_Point1[i] = cam_rot_1.cast<double>() * Wor_Point1[i] + cam_trans_1.cast<double>();
+					Wor_Point2[i] = cam_rot_2.cast<double>() * Wor_Point2[i] + cam_trans_2.cast<double>();
+					matrix_to_point3d(Wor_Point1[i],Cam_Point1[i]);
+					matrix_to_point3d(Wor_Point2[i],Cam_Point2[i]);
+					Point3d point_av = solve_point_av(Cam_Point1[i], Cam_Point2[i]);
+
+					geometry_msgs::Point marker_point;
+					marker_point.x = point_av.x;
+					marker_point.y = point_av.y;
+					marker_point.z = point_av.z;
+					points.points.push_back(marker_point);
+					line_strip.points.push_back(marker_point);
+				}
+				//检测到其他人的关节点
+				if(valid_score_last != valid_score){
+					points.points.clear();
+					line_strip.points.clear();
+					ROS_INFO("new found person!");
+					continue;
+				}
+
+			}
+			for
+			pose_pub.publish(points);
+			//pose_pub.publish(line_strip);*/
+		}
+		ros::spinOnce();
+		loop_rate.sleep();
+	}
+
+	return 0;
+}

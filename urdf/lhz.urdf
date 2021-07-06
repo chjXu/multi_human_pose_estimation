@@ -1,0 +1,205 @@
+<robot name="human_model_lhz">
+
+<link name="lhz/neck">
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+
+<link name="lhz/rShoulder">
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+<joint name="neck_to_rShoulder" type="continuous">
+	<origin rpy="0 0 0 " xyz="0.0 0.0 0.0"/>
+	<parent link="lhz/neck"/>
+	<child link="lhz/rShoulder"/>
+</joint>
+
+<link name="lhz/rArm">
+  <visual>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+
+  <collision>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+<joint name="rShoulder_to_rArm" type="fixed">
+	<origin rpy="0 0 0 " xyz="0.0 0.044134024 -0.066201036"/>
+	<parent link="lhz/rShoulder"/>
+	<child link="lhz/rArm"/>
+</joint>
+
+<link name="lhz/rWrist">
+  <visual>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+<joint name="rArm_to_rWrist" type="fixed">
+	<origin rpy="0 0 0 " xyz="0.0 0.044134024 -0.066201036"/>
+	<parent link="lhz/rArm"/>
+	<child link="lhz/rWrist"/>
+</joint>
+
+<link name="lhz/lShoulder">
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+
+  <collision>
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+<joint name="neck_to_lShoulder" type="continuous">
+	<origin rpy="0 0 0 " xyz="0.0 0.0 0.0"/>
+	<parent link="lhz/neck"/>
+	<child link="lhz/lShoulder"/>
+</joint>
+
+<link name="lhz/lArm">
+  <visual>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+
+  <collision>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+<joint name="lShoulder_to_lArm" type="fixed">
+	<origin rpy="0 0 0 " xyz="0.0 0.044134024 -0.066201036"/>
+	<parent link="lhz/lShoulder"/>
+	<child link="lhz/lArm"/>
+</joint>
+
+<link name="lhz/lWrist">
+  <visual>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+
+  <collision>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+<joint name="lArm_to_lWrist" type="fixed">
+	<origin rpy="0 0 0 " xyz="0.0 0.044134024 -0.066201036"/>
+	<parent link="lhz/lArm"/>
+	<child link="lhz/lWrist"/>
+</joint>
+<link name="lhz/hip">
+  <visual>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 0.8 1" />
+    </material>
+  </visual>
+
+  <collision>
+    <origin xyz="0 0 0" rpy="1.57 0 0" />
+    <geometry>
+      <sphere radius="0.05" />
+    </geometry>
+    <contact_coefficients mu="0" kp="1000.0" kd="1.0"/>
+  </collision>
+</link>
+
+<joint name="neck_to_hip" type="fixed">
+	<origin rpy="0 0 0 " xyz="0.0 0.0 0.0"/>
+	<parent link="lhz/neck"/>
+	<child link="lhz/hip"/>
+    <geometry>
+      <cylinder radius="0.01" />
+    </geometry>
+</joint>
+
+</robot>
